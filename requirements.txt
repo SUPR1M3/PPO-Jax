@@ -1,0 +1,13 @@
+# Tested on Python 3.13, macOS arm64 (CPU). For GPU, replace jax with jax[cuda12]==0.11.2.
+jax==0.11.2
+jaxlib==0.11.2
+flax==0.12.10
+optax==0.2.8
+distrax==0.1.9
+chex==0.1.92
+gymnax==0.0.9
+brax==0.14.2
+mujoco==3.16.0
+numpy==2.5.4
+matplotlib==3.11.2
+pytest==9.1.1
