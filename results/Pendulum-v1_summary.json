@@ -1,0 +1,43 @@
+{
+  "env_name": "Pendulum-v1",
+  "final_return_per_seed": [
+    -148.28,
+    -164.89,
+    -155.49
+  ],
+  "final_return_mean": -156.22,
+  "final_return_std": 6.8,
+  "compile_seconds": 1.43,
+  "train_seconds": 31.32,
+  "env_steps_total": 2998272,
+  "steps_per_second": 95720.74,
+  "device": "cpu:0",
+  "config": {
+    "env_name": "Pendulum-v1",
+    "env_backend": "gymnax",
+    "continuous": true,
+    "brax_episode_length": 1000,
+    "num_envs": 16,
+    "num_steps": 128,
+    "total_timesteps": 1000000,
+    "lr": 0.00025,
+    "anneal_lr": true,
+    "update_epochs": 10,
+    "num_minibatches": 32,
+    "max_grad_norm": 0.5,
+    "gamma": 0.95,
+    "gae_lambda": 0.95,
+    "clip_eps": 0.2,
+    "vf_coef": 0.5,
+    "ent_coef": 0.0,
+    "clip_vloss": false,
+    "normalize_obs": true,
+    "normalize_reward": true,
+    "hidden_size": 64,
+    "num_layers": 2,
+    "shared_trunk": false,
+    "seed": 0,
+    "num_seeds": 3,
+    "debug_print": false
+  }
+}
