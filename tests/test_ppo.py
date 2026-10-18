@@ -289,7 +289,7 @@ def test_cartpole_fall_on_last_step_counts_as_terminated():
 
 
 def test_pendulum_episodes_are_all_truncations():
-    env = ppo_jax.make_env(ppo_jax.make_config("Pendulum-v1"))
+    env = ppo_jax.make_env(ppo_jax.make_config("Pendulum-v1", num_envs=4))
     _, _, done, info = _random_rollout(env, 1000)
     assert done.sum() == 4 * 1000 // 200
     assert not info["terminated"].any() and jnp.all(info["truncated"] == done)
@@ -389,7 +389,7 @@ def _setup_rollout(env_name, **overrides):
 
 @pytest.mark.parametrize("env_name,obs_dim,action_shape", [("CartPole-v1", 4, ()), ("Pendulum-v1", 3, (1,))])
 def test_rollout_shapes(env_name, obs_dim, action_shape):
-    rollout, _, params, env_state, obs, rng = _setup_rollout(env_name)
+    rollout, _, params, env_state, obs, rng = _setup_rollout(env_name, num_envs=4)
     _, last_obs, _, traj = rollout(params, env_state, obs, rng, 16)
     T, N = 16, 4
     assert traj.obs.shape == (T, N, obs_dim) and last_obs.shape == (N, obs_dim)
@@ -619,7 +619,7 @@ def test_ppo_update_runs_and_changes_params(env_name):
 TINY = dict(total_timesteps=4 * 128 * 3)  # 3 updates
 
 
-@pytest.mark.parametrize("env_name,extra", [("CartPole-v1", {}), ("Pendulum-v1", dict(normalize_obs=True, normalize_reward=True))])
+@pytest.mark.parametrize("env_name,extra", [("CartPole-v1", {}), ("Pendulum-v1", dict(num_envs=4, num_minibatches=4))])
 def test_make_train_metrics_shapes(env_name, extra):
     config = ppo_jax.make_config(env_name, **TINY, **extra)
     runner_state, metrics = jax.jit(ppo_jax.make_train(config))(jax.random.PRNGKey(0))
