@@ -421,3 +421,79 @@ def test_rollout_depends_on_rng():
     _, _, _, a = rollout(params, env_state, obs, rng, 8)
     _, _, _, b = rollout(params, env_state, obs, jax.random.PRNGKey(123), 8)
     assert not jnp.allclose(a.action, b.action)
+
+
+# ---------------------------------------------------------------------------
+# GAE (Spec Sec. 3, 8)
+# ---------------------------------------------------------------------------
+def _gae_traj(reward, value, done, terminated, bootstrap_value):
+    """Transition with only the fields GAE reads filled in; inputs are (T, N)."""
+    arr = lambda x: jnp.asarray(x, jnp.float32)
+    zeros = jnp.zeros_like(arr(reward))
+    return ppo_jax.Transition(
+        obs=zeros, action=zeros, log_prob=zeros, value=arr(value), reward=arr(reward),
+        done=jnp.asarray(done, bool), terminated=jnp.asarray(terminated, bool),
+        bootstrap_value=arr(bootstrap_value), info={},
+    )
+
+
+def test_gae_hand_computed_with_done_mid_rollout():
+    """gamma = lambda = 0.5 (gamma*lambda = 0.25), r = 1 everywhere, V = [0.5, 1, 1.5, 2, 2.5],
+    V(s_T) = 3, episode ends at t = 2. Env 0: terminated (bootstrap 0). Env 1: truncated
+    (bootstrap from V(terminal obs) = 10). Bootstrap values elsewhere are garbage (99) and
+    must be ignored.
+
+    Backwards, both envs:
+      t=4: delta = 1 + 0.5*3   - 2.5 = 0     A = 0
+      t=3: delta = 1 + 0.5*2.5 - 2.0 = 0.25  A = 0.25 + 0.25*0 = 0.25
+    Env 0 (terminated at t=2, recursion cut):
+      t=2: delta = 1 + 0       - 1.5 = -0.5  A = -0.5
+      t=1: delta = 1 + 0.5*1.5 - 1.0 = 0.75  A = 0.75 + 0.25*(-0.5) = 0.625
+      t=0: delta = 1 + 0.5*1.0 - 0.5 = 1.0   A = 1.0 + 0.25*0.625   = 1.15625
+    Env 1 (truncated at t=2):
+      t=2: delta = 1 + 0.5*10  - 1.5 = 4.5   A = 4.5
+      t=1: A = 0.75 + 0.25*4.5   = 1.875
+      t=0: A = 1.0  + 0.25*1.875 = 1.46875
+    """
+    col = lambda x: np.stack([x, x], axis=1)  # same data for both envs -> (5, 2)
+    done = col(np.array([0, 0, 1, 0, 0], bool))
+    terminated = np.stack([done[:, 0], np.zeros(5, bool)], axis=1)
+    bootstrap = np.full((5, 2), 99.0)
+    bootstrap[2] = 10.0
+    values = col(np.array([0.5, 1.0, 1.5, 2.0, 2.5]))
+    traj = _gae_traj(np.ones((5, 2)), values, done, terminated, bootstrap)
+
+    adv, targets = ppo_jax.calculate_gae(traj, jnp.array([3.0, 3.0]), gamma=0.5, gae_lambda=0.5)
+    expected = np.array([[1.15625, 1.46875], [0.625, 1.875], [-0.5, 4.5], [0.25, 0.25], [0.0, 0.0]])
+    np.testing.assert_allclose(adv, expected, rtol=1e-6)
+    np.testing.assert_allclose(targets, expected + values, rtol=1e-6)
+
+
+def test_gae_lambda_limits():
+    """lambda=0 -> one-step TD error; lambda=1 -> discounted return minus V (no dones)."""
+    key_r, key_v = jax.random.split(jax.random.PRNGKey(0))
+    r = jax.random.normal(key_r, (6, 3))
+    v = jax.random.normal(key_v, (6, 3))
+    last_val, gamma = jnp.array([0.3, -1.0, 2.0]), 0.9
+    traj = _gae_traj(r, v, np.zeros((6, 3)), np.zeros((6, 3)), np.zeros((6, 3)))
+
+    adv0, _ = ppo_jax.calculate_gae(traj, last_val, gamma, 0.0)
+    next_v = jnp.concatenate([v[1:], last_val[None]])
+    np.testing.assert_allclose(adv0, r + gamma * next_v - v, rtol=1e-5, atol=1e-6)
+
+    _, targets1 = ppo_jax.calculate_gae(traj, last_val, gamma, 1.0)
+    ret, returns = last_val, []
+    for t in reversed(range(6)):
+        ret = r[t] + gamma * ret
+        returns.append(ret)
+    np.testing.assert_allclose(targets1, jnp.stack(returns[::-1]), rtol=1e-5, atol=1e-5)
+
+
+def test_gae_outputs_carry_no_gradient():
+    traj = _gae_traj(np.ones((4, 1)), np.ones((4, 1)), np.zeros((4, 1)), np.zeros((4, 1)), np.zeros((4, 1)))
+
+    def f(values):
+        adv, targets = ppo_jax.calculate_gae(traj._replace(value=values), jnp.ones(1), 0.99, 0.95)
+        return adv.sum() + targets.sum()
+
+    np.testing.assert_array_equal(jax.grad(f)(traj.value), 0.0)
