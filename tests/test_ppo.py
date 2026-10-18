@@ -599,3 +599,46 @@ def test_ppo_update_runs_and_changes_params(env_name):
     # LR annealing: linear decay from lr towards 0.
     total = config.num_updates * n_steps
     np.testing.assert_allclose(lr_fn(new_ts.step), config.lr * (1 - n_steps / total), rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# make_train: full jitted loop (Spec "Overall structure", Sec. 7, 8)
+# ---------------------------------------------------------------------------
+TINY = dict(total_timesteps=4 * 128 * 3)  # 3 updates
+
+
+@pytest.mark.parametrize("env_name,extra", [("CartPole-v1", {}), ("Pendulum-v1", dict(normalize_obs=True, normalize_reward=True))])
+def test_make_train_metrics_shapes(env_name, extra):
+    config = ppo_jax.make_config(env_name, **TINY, **extra)
+    runner_state, metrics = jax.jit(ppo_jax.make_train(config))(jax.random.PRNGKey(0))
+    expected = {"episodic_return", "episodic_length", "episodes_completed", "total_loss", "pg_loss",
+                "v_loss", "entropy", "approx_kl", "clip_frac", "explained_variance", "learning_rate", "env_steps"}
+    assert set(metrics) == expected
+    for name, value in metrics.items():
+        assert value.shape == (3,), name
+    np.testing.assert_array_equal(metrics["env_steps"], [512, 1024, 1536])
+    assert int(runner_state.train_state.step) == 3 * config.update_epochs * config.num_minibatches
+    assert jnp.all(jnp.diff(metrics["learning_rate"]) < 0)  # annealing
+
+
+def test_vmapped_seeds_differ():
+    """Spec Sec. 8: PRNG keys are split correctly -> different seeds, different results;
+    the same seed twice -> identical results."""
+    config = ppo_jax.make_config("CartPole-v1", **TINY)
+    keys = jax.random.split(jax.random.PRNGKey(0), 3)
+    keys = jnp.stack([keys[0], keys[1], keys[0]])  # seeds 0 and 2 are identical
+    runner_state, metrics = jax.jit(jax.vmap(ppo_jax.make_train(config)))(keys)
+    assert metrics["pg_loss"].shape == (3, 3)
+    kernel = runner_state.train_state.params["params"]["actor_head"]["kernel"]
+    assert not jnp.allclose(kernel[0], kernel[1])
+    assert not jnp.allclose(metrics["v_loss"][0], metrics["v_loss"][1])
+    np.testing.assert_array_equal(kernel[0], kernel[2])
+    np.testing.assert_array_equal(metrics["v_loss"][0], metrics["v_loss"][2])
+
+
+def test_debug_print(capsys):
+    config = ppo_jax.make_config("CartPole-v1", **TINY, debug_print=True)
+    jax.block_until_ready(jax.jit(ppo_jax.make_train(config))(jax.random.PRNGKey(0)))
+    jax.effects_barrier()
+    out = capsys.readouterr().out
+    assert "update     3/3" in out and "return" in out
