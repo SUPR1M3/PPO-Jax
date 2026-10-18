@@ -914,6 +914,44 @@ def make_train(config: PPOConfig):
 # =============================================================================
 # 9. Plotting / CLI
 # =============================================================================
+def ffill_nan(x) -> np.ndarray:
+    """Forward-fill NaNs along the last axis (updates where no episode finished keep the
+    previous episodic return). Leading NaNs stay NaN."""
+    x = np.asarray(x, dtype=np.float64)
+    idx = np.where(np.isnan(x), 0, np.arange(x.shape[-1]))
+    idx = np.maximum.accumulate(idx, axis=-1)
+    return np.take_along_axis(x, idx, axis=-1)
+
+
+DIAGNOSTIC_COLUMNS = (
+    ("episodic_return", "return", "{:9.2f}"),
+    ("pg_loss", "pg_loss", "{:8.4f}"),
+    ("v_loss", "v_loss", "{:9.4f}"),
+    ("entropy", "entropy", "{:7.3f}"),
+    ("approx_kl", "approx_kl", "{:9.5f}"),
+    ("clip_frac", "clip_frac", "{:9.3f}"),
+    ("explained_variance", "expl_var", "{:8.3f}"),
+    ("learning_rate", "lr", "{:9.2e}"),
+)
+
+
+def diagnostics_table(metrics: dict, num_rows: int = 10) -> str:
+    """Text table of the training metrics at num_rows evenly spaced updates, averaged over
+    seeds if metrics have a leading seed dimension."""
+    m = {k: np.asarray(v, dtype=np.float64) for k, v in metrics.items()}
+    m["episodic_return"] = ffill_nan(m["episodic_return"])
+    if m["env_steps"].ndim == 2:  # (num_seeds, num_updates) -> mean over seeds
+        m = {k: np.nanmean(v, axis=0) for k, v in m.items()}
+    num_updates = m["env_steps"].shape[0]
+    rows = np.unique(np.linspace(0, num_updates - 1, min(num_rows, num_updates)).astype(int))
+    header = f"{'steps':>10} " + " ".join(f"{label:>9}" for _, label, _ in DIAGNOSTIC_COLUMNS)
+    lines = [header]
+    for i in rows:
+        cells = " ".join(f"{fmt.format(m[key][i]):>9}" for key, _, fmt in DIAGNOSTIC_COLUMNS)
+        lines.append(f"{int(m['env_steps'][i]):>10} {cells}")
+    return "\n".join(lines)
+
+
 # TODO(Phase 11): plotting, timing, argparse entry point.
 
 if __name__ == "__main__":

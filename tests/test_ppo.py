@@ -1,4 +1,16 @@
-"""Unit tests and sanity checks for ppo_jax.py (Spec Sec. 8)."""
+"""Unit tests and sanity checks for ppo_jax.py (Spec Sec. 8).
+
+Run all:          pytest
+Skip slow ones:   pytest -m "not slow"
+
+Spec Sec. 8 checklist -> test:
+  ratio == 1 and approx_kl ~ 0 on first minibatch (no jit)  test_ratio_is_one_on_first_minibatch
+  GAE vs hand-computed example with a mid-rollout done      test_gae_hand_computed_with_done_mid_rollout
+  clipped-loss gradient zero / non-zero cases               test_clipped_surrogate_{zero,nonzero}_grad_*
+  continuous log_probs summed over action dims              test_gaussian_log_prob_summed_over_action_dims
+  vmapped seeds produce different results                   test_vmapped_seeds_differ
+  CartPole reaches ~500 within 5e5 steps                    test_cartpole_learns (slow)
+"""
 
 import dataclasses
 
@@ -642,3 +654,36 @@ def test_debug_print(capsys):
     jax.effects_barrier()
     out = capsys.readouterr().out
     assert "update     3/3" in out and "return" in out
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics helpers and end-to-end learning (Spec Sec. 7, 8)
+# ---------------------------------------------------------------------------
+def test_ffill_nan():
+    x = np.array([[np.nan, 1.0, np.nan, np.nan, 3.0, np.nan], [2.0, np.nan, 4.0, np.nan, np.nan, np.nan]])
+    out = ppo_jax.ffill_nan(x)
+    np.testing.assert_array_equal(out[0], [np.nan, 1, 1, 1, 3, 3])
+    np.testing.assert_array_equal(out[1], [2, 2, 4, 4, 4, 4])
+
+
+def test_diagnostics_table():
+    config = ppo_jax.make_config("CartPole-v1", **TINY)
+    _, metrics = jax.jit(jax.vmap(ppo_jax.make_train(config)))(jax.random.split(jax.random.PRNGKey(0), 2))
+    table = ppo_jax.diagnostics_table(metrics, num_rows=10)
+    lines = table.splitlines()
+    assert len(lines) == 1 + 3  # header + one row per update (only 3 updates)
+    assert "approx_kl" in lines[0] and lines[-1].split()[0] == "1536"
+
+
+@pytest.mark.slow
+def test_cartpole_learns():
+    """Spec Sec. 8: CartPole should reach ~500 return within 5e5 steps (3 seeds).
+    Judged on the mean return over the last 10 updates of each seed."""
+    config = ppo_jax.make_config("CartPole-v1")
+    keys = jax.random.split(jax.random.PRNGKey(config.seed), 3)
+    _, metrics = jax.jit(jax.vmap(ppo_jax.make_train(config)))(keys)
+    final = ppo_jax.ffill_nan(metrics["episodic_return"])[:, -10:].mean(axis=1)
+    assert final.mean() >= 475 and final.min() >= 400, (
+        f"CartPole did not reach ~500: final return per seed = {np.round(final, 1)}\n"
+        f"Diagnostics (mean over seeds):\n{ppo_jax.diagnostics_table(metrics)}"
+    )
