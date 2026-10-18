@@ -1,5 +1,7 @@
 """Unit tests and sanity checks for ppo_jax.py (Spec Sec. 8)."""
 
+import dataclasses
+
 import distrax
 import gymnax
 import jax
@@ -497,3 +499,103 @@ def test_gae_outputs_carry_no_gradient():
         return adv.sum() + targets.sum()
 
     np.testing.assert_array_equal(jax.grad(f)(traj.value), 0.0)
+
+
+# ---------------------------------------------------------------------------
+# PPO loss and update (Spec Sec. 5, 8)
+# ---------------------------------------------------------------------------
+EPS = 0.2
+
+
+def _surrogate_grad(r, a):
+    """d L^CLIP_loss / d logp for one sample with ratio r and advantage a."""
+    old_logp = jnp.float32(-1.3)
+    f = lambda logp: ppo_jax.clipped_surrogate(jnp.exp(logp - old_logp), jnp.float32(a), EPS)
+    return float(jax.grad(f)(old_logp + jnp.log(jnp.float32(r))))
+
+
+@pytest.mark.parametrize("r,a", [(1.5, 1.0), (0.5, -1.0)])
+def test_clipped_surrogate_zero_grad_when_clipped(r, a):
+    """(A>0, r>1+eps) and (A<0, r<1-eps): clipped term selected -> no gradient."""
+    assert _surrogate_grad(r, a) == 0.0
+
+
+@pytest.mark.parametrize("r,a", [(0.5, 1.0), (1.5, -1.0), (1.0, 1.0), (1.1, -1.0), (0.9, 1.0)])
+def test_clipped_surrogate_nonzero_grad_otherwise(r, a):
+    """(A>0, r<1-eps), (A<0, r>1+eps) and inside the range: unclipped term selected,
+    loss = -r*A so d/dlogp = -r*A (since dr/dlogp = r)."""
+    np.testing.assert_allclose(_surrogate_grad(r, a), -r * a, rtol=1e-5)
+
+
+def _rollout_and_gae(env_name, **overrides):
+    config = ppo_jax.make_config(env_name, **overrides)
+    env = ppo_jax.make_env(config)
+    net = ppo_jax.make_network(config, env.action_dim)
+    k_init, k_reset, k_roll, k_upd = jax.random.split(jax.random.PRNGKey(0), 4)
+    obs, env_state = env.reset(k_reset)
+    tx, lr_fn = ppo_jax.make_optimizer(config)
+    train_state = ppo_jax.TrainState.create(apply_fn=net.apply, params=net.init(k_init, obs), tx=tx)
+    _, last_obs, _, traj = ppo_jax.collect_rollout(env, net.apply, train_state.params, env_state, obs, k_roll, config.num_steps)
+    _, last_val = net.apply(train_state.params, last_obs)
+    adv, targets = ppo_jax.calculate_gae(traj, last_val, config.gamma, config.gae_lambda)
+    return config, train_state, lr_fn, traj, adv, targets, k_upd
+
+
+@pytest.mark.parametrize("env_name", ["CartPole-v1", "Pendulum-v1"])
+def test_ratio_is_one_on_first_minibatch(env_name):
+    """Spec Sec. 8: without jit, before any update the new policy == old policy, so on the
+    first minibatch of the first epoch ratio == 1 exactly and approx_kl == 0."""
+    with jax.disable_jit():
+        config, ts, _, traj, adv, targets, key = _rollout_and_gae(env_name, num_steps=16)
+        batch = ppo_jax.Batch(traj.obs, traj.action, traj.log_prob, traj.value, adv, targets)
+        batch = jax.tree.map(lambda x: x.reshape((config.batch_size,) + x.shape[2:]), batch)
+        _, perm_key = jax.random.split(key)  # same key ppo_update uses for epoch 0
+        first = jax.tree.map(lambda x: x[0], ppo_jax.make_minibatches(batch, perm_key, config.num_minibatches))
+
+        pi, _ = ts.apply_fn(ts.params, first.obs)
+        ratio = jnp.exp(pi.log_prob(first.action) - first.log_prob)
+        np.testing.assert_array_equal(ratio, 1.0)
+        _, aux = ppo_jax.ppo_loss(ts.params, ts.apply_fn, first, config)
+        assert aux["approx_kl"] == 0.0 and aux["clip_frac"] == 0.0
+
+        _, _, metrics = ppo_jax.ppo_update(ts, traj, adv, targets, key, config)
+        assert metrics["approx_kl"][0, 0] == 0.0  # same minibatch inside the real update
+
+
+def test_make_minibatches_is_a_partition():
+    batch = ppo_jax.Batch(*(jnp.arange(12.0) for _ in range(6)))
+    mbs = ppo_jax.make_minibatches(batch, jax.random.PRNGKey(0), 3)
+    assert mbs.obs.shape == (3, 4)
+    np.testing.assert_array_equal(jnp.sort(mbs.obs.reshape(-1)), jnp.arange(12.0))
+    np.testing.assert_array_equal(mbs.obs, mbs.targets)  # all fields shuffled identically
+
+
+def test_value_clipping_matches_unclipped_at_old_value():
+    config, ts, _, traj, adv, targets, _ = _rollout_and_gae("CartPole-v1", num_steps=16)
+    batch = ppo_jax.Batch(traj.obs, traj.action, traj.log_prob, traj.value, adv, targets)
+    batch = jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:]), batch)
+    _, a = ppo_jax.ppo_loss(ts.params, ts.apply_fn, batch, config)
+    _, b = ppo_jax.ppo_loss(ts.params, ts.apply_fn, batch, dataclasses.replace(config, clip_vloss=True))
+    np.testing.assert_allclose(a["v_loss"], b["v_loss"], rtol=1e-6)  # V == V_old -> no clipping
+
+
+@pytest.mark.parametrize("env_name", ["CartPole-v1", "Pendulum-v1"])
+def test_ppo_update_runs_and_changes_params(env_name):
+    config, ts, lr_fn, traj, adv, targets, key = _rollout_and_gae(env_name)
+    update = jax.jit(lambda ts, traj, adv, tgt, key: ppo_jax.ppo_update(ts, traj, adv, tgt, key, config))
+    new_ts, new_key, metrics = update(ts, traj, adv, targets, key)
+
+    n_steps = config.update_epochs * config.num_minibatches
+    assert int(new_ts.step) == n_steps
+    assert not jnp.array_equal(new_key, key)
+    for name in ("total_loss", "pg_loss", "v_loss", "entropy", "approx_kl", "clip_frac"):
+        assert metrics[name].shape == (config.update_epochs, config.num_minibatches), name
+        assert jnp.all(jnp.isfinite(metrics[name])), name
+    changed = jax.tree.map(lambda a, b: not jnp.array_equal(a, b), ts.params, new_ts.params)
+    assert all(jax.tree.leaves(changed))
+    # Policy moved but stayed close to the old one (KL small, value fit improved).
+    assert 0.0 < float(metrics["approx_kl"][-1].mean()) < 0.1
+    assert metrics["v_loss"][-1].mean() < metrics["v_loss"][0].mean()
+    # LR annealing: linear decay from lr towards 0.
+    total = config.num_updates * n_steps
+    np.testing.assert_allclose(lr_fn(new_ts.step), config.lr * (1 - n_steps / total), rtol=1e-5)
