@@ -16,7 +16,12 @@ Layout (each section names the part of the paper it implements):
     9. Plotting / CLI
 """
 
+import argparse
 import dataclasses
+import json
+import os
+import time
+import warnings
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -146,8 +151,12 @@ BRAX_DEFAULTS = dict(
 # Per-env preset: (backend defaults, env-specific overrides).
 ENV_PRESETS = {
     "CartPole-v1": (GYMNAX_DEFAULTS, {}),
-    # TODO(Phase 11): tune Pendulum (likely needs normalization, more envs/steps).
-    "Pendulum-v1": (GYMNAX_DEFAULTS, {"continuous": True}),
+    # Tuned (see README): CartPole defaults reach only ~-1070. Normalization, no entropy
+    # bonus, a shorter horizon (gamma 0.95), more epochs and smaller minibatches give ~-160.
+    "Pendulum-v1": (GYMNAX_DEFAULTS, dict(
+        continuous=True, normalize_obs=True, normalize_reward=True, ent_coef=0.0, gamma=0.95,
+        num_envs=16, num_steps=128, update_epochs=10, num_minibatches=32, total_timesteps=1_000_000,
+    )),
     **{name: (BRAX_DEFAULTS, {}) for name in ("halfcheetah", "ant", "hopper", "walker2d", "humanoid")},
 }
 
@@ -941,7 +950,9 @@ def diagnostics_table(metrics: dict, num_rows: int = 10) -> str:
     m = {k: np.asarray(v, dtype=np.float64) for k, v in metrics.items()}
     m["episodic_return"] = ffill_nan(m["episodic_return"])
     if m["env_steps"].ndim == 2:  # (num_seeds, num_updates) -> mean over seeds
-        m = {k: np.nanmean(v, axis=0) for k, v in m.items()}
+        with warnings.catch_warnings():  # all-NaN columns (e.g. EV with constant targets)
+            warnings.simplefilter("ignore", RuntimeWarning)
+            m = {k: np.nanmean(v, axis=0) for k, v in m.items()}
     num_updates = m["env_steps"].shape[0]
     rows = np.unique(np.linspace(0, num_updates - 1, min(num_rows, num_updates)).astype(int))
     header = f"{'steps':>10} " + " ".join(f"{label:>9}" for _, label, _ in DIAGNOSTIC_COLUMNS)
@@ -952,7 +963,186 @@ def diagnostics_table(metrics: dict, num_rows: int = 10) -> str:
     return "\n".join(lines)
 
 
-# TODO(Phase 11): plotting, timing, argparse entry point.
+def run_experiment(config: PPOConfig):
+    """Train config.num_seeds seeds in parallel (jit(vmap(train))) and time it.
+
+    Compilation is timed separately from the run so steps/sec reflects training only.
+    Returns (metrics as numpy arrays of shape (num_seeds, num_updates), timing dict)."""
+    keys = jax.random.split(jax.random.PRNGKey(config.seed), config.num_seeds)
+    train = jax.jit(jax.vmap(make_train(config)))
+
+    t0 = time.perf_counter()
+    compiled = train.lower(keys).compile()
+    t1 = time.perf_counter()
+    _, metrics = jax.block_until_ready(compiled(keys))
+    t2 = time.perf_counter()
+
+    total_steps = config.num_seeds * config.num_updates * config.batch_size
+    timing = {
+        "compile_seconds": t1 - t0,
+        "train_seconds": t2 - t1,
+        "env_steps_total": total_steps,
+        "steps_per_second": total_steps / (t2 - t1),
+        "device": str(jax.devices()[0]),
+    }
+    return jax.tree.map(np.asarray, metrics), timing
+
+
+# Chart styling: one series per panel, so no legend -- the title names it.
+SERIES_COLOR = "#2a78d6"  # categorical slot 1
+TEXT_PRIMARY, TEXT_SECONDARY, GRID_COLOR, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
+
+
+def smooth(x, window: int) -> np.ndarray:
+    """Trailing moving average along the last axis, ignoring NaNs (the first window-1
+    points average over what is available)."""
+    x = np.asarray(x, dtype=np.float64)
+    valid = ~np.isnan(x)
+    csum = np.cumsum(np.where(valid, x, 0.0), axis=-1)
+    ccount = np.cumsum(valid, axis=-1)
+    shift = lambda c: np.concatenate([np.zeros_like(c[..., :window]), c[..., :-window]], axis=-1)
+    total, count = csum - shift(csum), ccount - shift(ccount)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(count > 0, total / count, np.nan)
+
+
+def _steps_formatter(value, _pos):
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(value) >= scale:
+            return f"{value / scale:g}{suffix}"
+    return f"{value:g}"
+
+
+def _style_axes(ax, title, ylabel):
+    ax.set_facecolor(SURFACE)
+    ax.set_title(title, loc="left", fontsize=11, color=TEXT_PRIMARY)
+    ax.set_xlabel("environment steps", color=TEXT_SECONDARY, fontsize=9)
+    ax.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=9)
+    ax.grid(True, color=GRID_COLOR, linewidth=0.6)
+    ax.set_axisbelow(True)
+    ax.tick_params(colors=TEXT_SECONDARY, labelsize=8)
+    ax.xaxis.set_major_formatter(_steps_formatter)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(GRID_COLOR)
+
+
+def _mean_std_line(ax, steps, values):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean, std = np.nanmean(values, axis=0), np.nanstd(values, axis=0)
+    ax.fill_between(steps, mean - std, mean + std, color=SERIES_COLOR, alpha=0.18, linewidth=0)
+    ax.plot(steps, mean, color=SERIES_COLOR, linewidth=2)
+
+
+def plot_results(metrics: dict, config: PPOConfig, out_dir: str) -> list[str]:
+    """Save (1) episodic return mean +- std across seeds vs env steps and (2) a 2x2 panel of
+    training diagnostics. Returns the saved file paths."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps = metrics["env_steps"][0]
+    window = max(1, config.num_updates // 100)  # smooth each seed over 1% of training
+    returns = smooth(ffill_nan(metrics["episodic_return"]), window)
+    name = config.env_name
+    subtitle = f"mean ± std over {config.num_seeds} seeds" + (
+        f", {window}-update moving average" if window > 1 else ""
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 4.2), facecolor=SURFACE)
+    _mean_std_line(ax, steps, returns)
+    _style_axes(ax, f"{name}: episodic return\n{subtitle}", "episodic return")
+    fig.tight_layout()
+    returns_path = os.path.join(out_dir, f"{name}_returns.png")
+    fig.savefig(returns_path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+
+    panels = [
+        ("approx_kl", "Approx. KL (old || new)"),
+        ("clip_frac", "Clip fraction"),
+        ("entropy", "Policy entropy"),
+        ("explained_variance", "Explained variance"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6.5), facecolor=SURFACE)
+    for ax, (key, title) in zip(axes.flat, panels):
+        _mean_std_line(ax, steps, smooth(metrics[key], window))
+        _style_axes(ax, title, key)
+    axes.flat[0].set_ylim(bottom=0)  # KL and clip fraction are non-negative
+    axes.flat[1].set_ylim(bottom=0)
+    axes.flat[3].set_ylim(-1.05, 1.05)  # EV <= 1; values below -1 carry no extra information
+    fig.suptitle(f"{name}: training diagnostics, {subtitle}",
+                 x=0.01, ha="left", fontsize=12, color=TEXT_PRIMARY)
+    fig.tight_layout()
+    diag_path = os.path.join(out_dir, f"{name}_diagnostics.png")
+    fig.savefig(diag_path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    return [returns_path, diag_path]
+
+
+def save_results(metrics: dict, timing: dict, config: PPOConfig, out_dir: str) -> dict:
+    """Save raw metrics (.npz) and a JSON summary (config, timing, final returns)."""
+    os.makedirs(out_dir, exist_ok=True)
+    np.savez_compressed(os.path.join(out_dir, f"{config.env_name}_metrics.npz"), **metrics)
+    final = ffill_nan(metrics["episodic_return"])[:, -10:].mean(axis=1)  # last 10 updates
+    summary = {
+        "env_name": config.env_name,
+        "final_return_per_seed": [round(float(x), 2) for x in final],
+        "final_return_mean": round(float(final.mean()), 2),
+        "final_return_std": round(float(final.std()), 2),
+        **{k: (round(v, 2) if isinstance(v, float) else v) for k, v in timing.items()},
+        "config": dataclasses.asdict(config),
+    }
+    with open(os.path.join(out_dir, f"{config.env_name}_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+
+def parse_args(argv=None):
+    """CLI: --env picks the preset; every PPOConfig field can be overridden as --field-name."""
+    parser = argparse.ArgumentParser(description="PPO-Clip in pure JAX")
+    parser.add_argument("--env", required=True, choices=sorted(ENV_PRESETS))
+    parser.add_argument("--out", default="results", help="output directory")
+    parser.add_argument("--no-plot", action="store_true")
+    for field in dataclasses.fields(PPOConfig):
+        if field.name in ("env_name", "env_backend"):
+            continue  # set by the preset
+        flag = "--" + field.name.replace("_", "-")
+        if field.type is bool:
+            parser.add_argument(flag, dest=field.name, action=argparse.BooleanOptionalAction, default=None)
+        elif field.type is int:  # accept 5e5-style values for step counts
+            parser.add_argument(flag, dest=field.name, type=lambda s: int(float(s)), default=None)
+        else:
+            parser.add_argument(flag, dest=field.name, type=field.type, default=None)
+    args = parser.parse_args(argv)
+    overrides = {
+        f.name: getattr(args, f.name)
+        for f in dataclasses.fields(PPOConfig)
+        if f.name not in ("env_name", "env_backend") and getattr(args, f.name) is not None
+    }
+    return args, make_config(args.env, **overrides)
+
+
+def main(argv=None):
+    args, config = parse_args(argv)
+    print(f"JAX {jax.__version__} on {jax.devices()}")
+    print(f"{config.env_name}: {config.num_seeds} seeds x {config.num_updates} updates x "
+          f"{config.batch_size} steps (num_envs={config.num_envs}, num_steps={config.num_steps})")
+
+    metrics, timing = run_experiment(config)
+    summary = save_results(metrics, timing, config, args.out)
+
+    print(diagnostics_table(metrics))
+    print(f"\ncompile {timing['compile_seconds']:.1f}s | train {timing['train_seconds']:.1f}s | "
+          f"{timing['steps_per_second']:,.0f} env steps/s ({config.num_seeds} seeds, {timing['device']})")
+    print(f"final return (last 10 updates): {summary['final_return_mean']:.2f} ± "
+          f"{summary['final_return_std']:.2f}  per seed: {summary['final_return_per_seed']}")
+    if not args.no_plot:
+        for path in plot_results(metrics, config, args.out):
+            print(f"saved {path}")
+
 
 if __name__ == "__main__":
-    print(f"JAX {jax.__version__} on {jax.devices()}")
+    main()
