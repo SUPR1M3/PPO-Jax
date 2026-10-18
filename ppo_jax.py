@@ -810,7 +810,105 @@ def ppo_update(train_state: TrainState, traj: Transition, advantages, targets, r
 # =============================================================================
 # 8. make_train -- the full training loop (paper Algorithm 1)
 # =============================================================================
-# TODO(Phase 9): make_train(config) -> train(rng) -> (runner_state, metrics).
+class RunnerState(NamedTuple):
+    """Everything carried between updates. Observation / reward normalization statistics
+    live inside env_state (in the normalization wrappers' states), so they are threaded
+    through the loop explicitly like everything else -- there is no hidden mutable state."""
+
+    train_state: TrainState  # params, optimizer state, step count
+    env_state: Any  # wrapper-stack state (incl. normalization stats and episode logs)
+    last_obs: jnp.ndarray  # (num_envs, obs_dim), the obs the next action is chosen from
+    rng: jax.Array
+
+
+def episode_stats(info: dict) -> dict:
+    """Mean return/length of the episodes that finished during this rollout. NaN when none
+    finished (e.g. Brax, where all envs hit the time limit together) -- plots forward-fill."""
+    mask = info["returned_episode"]
+    count = mask.sum()
+    mean = lambda x: jnp.where(count > 0, (x * mask).sum() / jnp.maximum(count, 1), jnp.nan)
+    return {
+        "episodic_return": mean(info["returned_episode_returns"]),
+        "episodic_length": mean(info["returned_episode_lengths"]),
+        "episodes_completed": count,
+    }
+
+
+def explained_variance(values, targets):
+    """1 - Var[targets - V] / Var[targets]: 1 = perfect value predictions, <= 0 = no better
+    than predicting the mean."""
+    var_targets = jnp.var(targets)
+    return jnp.where(var_targets > 0, 1.0 - jnp.var(targets - values) / var_targets, jnp.nan)
+
+
+def make_train(config: PPOConfig):
+    """Build env, network and optimizer (Python side), and return a pure function
+    train(rng) -> (final RunnerState, metrics) that runs all of PPO (paper Algorithm 1):
+
+        for iteration = 1, 2, ... (num_updates):
+            run pi_theta_old in N envs for T steps          -> collect_rollout
+            compute advantage estimates A_1..A_T            -> calculate_gae
+            optimize surrogate for K epochs, minibatches M  -> ppo_update
+            theta_old <- theta
+
+    train is jit-able and vmap-able over rng: jax.jit(jax.vmap(make_train(c)))(keys).
+    metrics is a dict of arrays with leading dim num_updates."""
+    env = make_env(config)
+    network = make_network(config, env.action_dim)
+    tx, lr_fn = make_optimizer(config)
+    print_every = max(1, config.num_updates // 20)
+
+    def _print_metrics(m):  # host-side, only used when config.debug_print
+        update = int(m["env_steps"]) // config.batch_size
+        if update % print_every == 0 or update == config.num_updates:
+            print(
+                f"update {update:5d}/{config.num_updates} | steps {int(m['env_steps']):>9d} | "
+                f"return {float(m['episodic_return']):8.2f} | entropy {float(m['entropy']):6.3f} | "
+                f"kl {float(m['approx_kl']):.4f} | clip {float(m['clip_frac']):.3f} | "
+                f"ev {float(m['explained_variance']):6.3f}"
+            )
+
+    def train(rng):
+        # Separate keys for network init, env reset, and the training loop.
+        rng, init_key, reset_key = jax.random.split(rng, 3)
+        obs, env_state = env.reset(reset_key)
+        params = network.init(init_key, obs)
+        train_state = TrainState.create(apply_fn=network.apply, params=params, tx=tx)
+        runner_state = RunnerState(train_state, env_state, obs, rng)
+
+        def _update_step(runner_state: RunnerState, update_idx):
+            train_state, env_state, last_obs, rng = runner_state
+
+            # 1. Collect a rollout with the current (old) policy.
+            env_state, last_obs, rng, traj = collect_rollout(
+                env, train_state.apply_fn, train_state.params, env_state, last_obs, rng, config.num_steps
+            )
+
+            # 2. Advantages, bootstrapping from V(s_T) of the obs after the rollout.
+            _, last_val = train_state.apply_fn(train_state.params, last_obs)
+            advantages, targets = calculate_gae(traj, last_val, config.gamma, config.gae_lambda)
+
+            # 3. K epochs of minibatch updates on the clipped surrogate.
+            lr = lr_fn(train_state.step)  # lr in effect at the start of this update
+            train_state, rng, loss_info = ppo_update(train_state, traj, advantages, targets, rng, config)
+
+            metrics = {
+                **episode_stats(traj.info),
+                **jax.tree.map(jnp.mean, loss_info),  # averaged over epochs x minibatches
+                "explained_variance": explained_variance(traj.value, targets),
+                "learning_rate": lr,
+                "env_steps": (update_idx + 1) * config.batch_size,
+            }
+            if config.debug_print:
+                jax.debug.callback(_print_metrics, metrics)
+            return RunnerState(train_state, env_state, last_obs, rng), metrics
+
+        runner_state, metrics = jax.lax.scan(
+            _update_step, runner_state, jnp.arange(config.num_updates)
+        )
+        return runner_state, metrics
+
+    return train
 
 
 # =============================================================================
