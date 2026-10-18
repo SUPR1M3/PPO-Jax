@@ -658,7 +658,31 @@ def collect_rollout(env, apply_fn, params, env_state, last_obs, rng, num_steps: 
 # =============================================================================
 # 6. GAE -- generalized advantage estimation (paper eq. 11-12)
 # =============================================================================
-# TODO(Phase 7): calculate_gae via reverse lax.scan.
+def calculate_gae(traj: Transition, last_val: jnp.ndarray, gamma: float, gae_lambda: float):
+    """Generalized advantage estimation, computed backwards in time with a reverse scan:
+
+        delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)                       (paper eq. 12)
+        A_t     = delta_t + gamma * lambda * A_{t+1}                      (paper eq. 11)
+
+    Episode boundaries (done_t = terminated | truncated):
+      - A_{t+1} belongs to the next episode, so the recursion is cut: (1 - done_t).
+      - V(s_{t+1}) is 0 if the episode terminated, and V(terminal obs) (bootstrap_value)
+        if it was truncated by a time limit -- the episode could have continued.
+    The last step bootstraps from last_val = V(s_T) of the obs after the rollout.
+
+    Returns (advantages, targets) with targets = advantages + values (the value-function
+    regression targets). Both are treated as constants by the loss (stop_gradient)."""
+
+    def _step(carry, t: Transition):
+        gae, next_value = carry  # A_{t+1}, V(s_{t+1}) if the episode continues
+        next_value = jnp.where(t.done, jnp.where(t.terminated, 0.0, t.bootstrap_value), next_value)
+        delta = t.reward + gamma * next_value - t.value
+        gae = delta + gamma * gae_lambda * (1.0 - t.done) * gae
+        return (gae, t.value), gae
+
+    _, advantages = jax.lax.scan(_step, (jnp.zeros_like(last_val), last_val), traj, reverse=True)
+    targets = advantages + traj.value
+    return jax.lax.stop_gradient(advantages), jax.lax.stop_gradient(targets)
 
 
 # =============================================================================
