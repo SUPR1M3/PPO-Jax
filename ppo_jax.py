@@ -688,7 +688,123 @@ def calculate_gae(traj: Transition, last_val: jnp.ndarray, gamma: float, gae_lam
 # =============================================================================
 # 7. PPO loss -- clipped surrogate objective L^CLIP + c1 L^VF - c2 S (paper eq. 7, 9)
 # =============================================================================
-# TODO(Phase 8): clipped_surrogate, ppo_loss.
+class Batch(NamedTuple):
+    """Flattened training samples (leading dim = batch or minibatch size)."""
+
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    log_prob: jnp.ndarray  # log pi_old(a|s)
+    value: jnp.ndarray  # V_old(s), used for optional value clipping
+    advantages: jnp.ndarray
+    targets: jnp.ndarray
+
+
+def clipped_surrogate(ratio, advantages, clip_eps):
+    """Negated clipped surrogate objective (paper eq. 7):
+
+        L^CLIP = E[ min(r_t A_t, clip(r_t, 1-eps, 1+eps) A_t) ]
+
+    Taking the min makes this a pessimistic bound: once the ratio moves past 1+eps (A>0)
+    or below 1-eps (A<0), the clipped term is selected and its gradient is zero, so there
+    is no incentive to move the policy further in that direction."""
+    unclipped = ratio * advantages
+    clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+    return -jnp.mean(jnp.minimum(unclipped, clipped))
+
+
+def ppo_loss(params, apply_fn, batch: Batch, config: PPOConfig):
+    """Total loss = -L^CLIP + c1 L^VF - c2 S  (paper eq. 9, written as a loss to minimize).
+
+    Returns (total_loss, aux) where aux holds the components and diagnostics."""
+    pi, value = apply_fn(params, batch.obs)
+    log_prob = pi.log_prob(batch.action)
+
+    # Old log-probs and advantages are constants: no gradient flows into them.
+    old_log_prob = jax.lax.stop_gradient(batch.log_prob)
+    advantages = jax.lax.stop_gradient(batch.advantages)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # per minibatch
+
+    # Probability ratio r_t(theta) = pi_theta(a|s) / pi_theta_old(a|s)  (paper eq. 6)
+    log_ratio = log_prob - old_log_prob
+    ratio = jnp.exp(log_ratio)
+    pg_loss = clipped_surrogate(ratio, advantages, config.clip_eps)
+
+    # Value loss L^VF = (V(s) - V_targ)^2 (paper eq. 9), with the conventional 0.5 factor.
+    if config.clip_vloss:
+        # Optional: limit how far V moves from V_old per update, mirroring the policy clip.
+        value_clipped = batch.value + jnp.clip(value - batch.value, -config.clip_eps, config.clip_eps)
+        v_loss = 0.5 * jnp.mean(
+            jnp.maximum((value - batch.targets) ** 2, (value_clipped - batch.targets) ** 2)
+        )
+    else:
+        v_loss = 0.5 * jnp.mean((value - batch.targets) ** 2)
+
+    # Entropy bonus S[pi_theta] encourages exploration (paper eq. 9).
+    entropy = jnp.mean(pi.entropy())
+
+    total_loss = pg_loss + config.vf_coef * v_loss - config.ent_coef * entropy
+
+    # Diagnostics: KL(old || new) estimator (r - 1) - log r (unbiased, always >= 0),
+    # and the fraction of samples whose ratio is outside the clip range.
+    approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
+    clip_frac = jnp.mean(jnp.abs(ratio - 1.0) > config.clip_eps)
+    aux = dict(pg_loss=pg_loss, v_loss=v_loss, entropy=entropy, approx_kl=approx_kl, clip_frac=clip_frac)
+    return total_loss, aux
+
+
+def make_optimizer(config: PPOConfig):
+    """Adam with global-norm gradient clipping and optional linear lr annealing to 0.
+
+    Returns (optax transform, lr_fn) where lr_fn(step) gives the lr after `step`
+    optimizer updates (for logging)."""
+    if config.anneal_lr:
+        total_steps = config.num_updates * config.update_epochs * config.num_minibatches
+        lr_fn = optax.linear_schedule(config.lr, 0.0, transition_steps=total_steps)
+    else:
+        lr_fn = optax.constant_schedule(config.lr)
+    tx = optax.chain(
+        optax.clip_by_global_norm(config.max_grad_norm),
+        optax.adam(learning_rate=lr_fn, eps=1e-5),
+    )
+    return tx, lr_fn
+
+
+def make_minibatches(batch: Batch, key: jax.Array, num_minibatches: int) -> Batch:
+    """Shuffle a flat batch and split it into num_minibatches equal minibatches
+    (leading dims: (num_minibatches, minibatch_size, ...))."""
+    batch_size = batch.obs.shape[0]
+    perm = jax.random.permutation(key, batch_size)
+    return jax.tree.map(
+        lambda x: x[perm].reshape((num_minibatches, -1) + x.shape[1:]), batch
+    )
+
+
+def ppo_update(train_state: TrainState, traj: Transition, advantages, targets, rng, config: PPOConfig):
+    """Optimize the surrogate for K epochs with minibatch SGD (paper Algorithm 1:
+    "Optimize surrogate L wrt theta, with K epochs and minibatch size M <= NT").
+
+    Returns (train_state, rng, metrics) with each metric of shape (update_epochs, num_minibatches)."""
+    batch = Batch(traj.obs, traj.action, traj.log_prob, traj.value, advantages, targets)
+    # (num_steps, num_envs, ...) -> (num_steps * num_envs, ...)
+    batch = jax.tree.map(lambda x: x.reshape((config.batch_size,) + x.shape[2:]), batch)
+
+    def _update_minibatch(train_state, minibatch):
+        grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+        (loss, aux), grads = grad_fn(train_state.params, train_state.apply_fn, minibatch, config)
+        train_state = train_state.apply_gradients(grads=grads)
+        return train_state, {"total_loss": loss, **aux}
+
+    def _update_epoch(carry, _):
+        train_state, rng = carry
+        rng, perm_key = jax.random.split(rng)
+        minibatches = make_minibatches(batch, perm_key, config.num_minibatches)
+        train_state, metrics = jax.lax.scan(_update_minibatch, train_state, minibatches)
+        return (train_state, rng), metrics
+
+    (train_state, rng), metrics = jax.lax.scan(
+        _update_epoch, (train_state, rng), None, length=config.update_epochs
+    )
+    return train_state, rng, metrics
 
 
 # =============================================================================
